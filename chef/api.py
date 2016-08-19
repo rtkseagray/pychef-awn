@@ -13,7 +13,7 @@ import pkg_resources
 import requests
 
 from chef.auth import sign_request
-from chef.exceptions import ChefServerError
+from chef.exceptions import ChefServerError, ChefServerNotFoundError
 from chef.rsa import Key
 from chef.utils import json
 from chef.utils.file import walk_backwards
@@ -56,7 +56,8 @@ class ChefAPI(object):
     env_value_re = re.compile(r'ENV\[(.+)\]')
     ruby_string_re = re.compile(r'^\s*(["\'])(.*?)\1\s*$')
 
-    def __init__(self, url, key, client, version='0.10.8', headers={}, ssl_verify=True):
+    def __init__(self, url, key, client, version='0.10.8', validation_client_name=None, validation_key=None, headers={},
+                 ssl_verify=True, ssl_client_cert=None, ssl_client_key=None):
         self.url = url.rstrip('/')
         self.parsed_url = six.moves.urllib.parse.urlparse(self.url)
         if not isinstance(key, Key):
@@ -70,6 +71,10 @@ class ChefAPI(object):
         self.version_parsed = pkg_resources.parse_version(self.version)
         self.platform = self.parsed_url.hostname == 'api.opscode.com'
         self.ssl_verify = ssl_verify
+        self.validation_client_name = validation_client_name
+        self.validation_key = validation_key
+        self.ssl_client_cert = ssl_client_cert
+        self.ssl_client_key = ssl_client_key
         if not api_stack_value():
             self.set_default()
 
@@ -83,7 +88,7 @@ class ChefAPI(object):
             # Can't even read the config file
             log.debug('Unable to read config file "%s"', path)
             return
-        url = key_path = client_name = None
+        url = key_path = client_name = validation_client_name = validation_key = ssl_client_cert = ssl_client_key = None
         ssl_verify = True
         for line in open(path):
             if not line.strip() or line.startswith('#'):
@@ -120,6 +125,21 @@ class ChefAPI(object):
             if key == 'chef_server_url':
                 log.debug('Found URL: %r', value)
                 url = value
+            elif key == 'validation_client_name':
+                log.debug('Found validation_client_name: %r', value)
+                validation_client_name = value
+            elif key == 'validation_key':
+                log.debug('Found validation_key: %r', value)
+                validation_key = value
+            elif key == 'ssl_ca_file':
+                log.debug('Found ssl_ca_file name: %r', value)
+                ssl_ca_file = value
+            elif key == 'ssl_client_cert':
+                log.debug('Found ssl_client_cert: %r', value)
+                ssl_client_cert = value
+            elif key == 'ssl_client_key':
+                log.debug('Found ssl_client_key: %r', value)
+                ssl_client_key = value
             elif key == 'node_name':
                 log.debug('Found client name: %r', value)
                 client_name = value
@@ -143,6 +163,11 @@ class ChefAPI(object):
                 url = data.get('chef_server_url')
                 client_name = data.get('node_name')
                 key_path = data.get('client_key')
+                validation_key = data.get('validation_key')
+                validation_client_name = data.get('validation_client_name')
+                ssl_ca_file = data.get('ssl_ca_file')
+                ssl_client_cert = data.get('ssl_client_cert')
+                ssl_client_key = data.get('ssl_client_key')
             else:
                 log.debug('Ruby parse failed with exit code %s: %s', proc.returncode, out.strip())
         if not url:
@@ -158,7 +183,10 @@ class ChefAPI(object):
             return
         if not client_name:
             client_name = socket.getfqdn()
-        return cls(url, key_path, client_name, ssl_verify=ssl_verify)
+        if ssl_verify and ssl_ca_file:
+            ssl_verify = ssl_ca_file
+        return cls(url, key_path, client_name, ssl_verify=ssl_verify, ssl_client_cert=ssl_client_cert,
+                   ssl_client_key=ssl_client_key)
 
     @staticmethod
     def get_global():
@@ -185,7 +213,14 @@ class ChefAPI(object):
         del api_stack_value()[-1]
 
     def _request(self, method, url, data, headers):
-        return requests.api.request(method, url, headers=headers, data=data, verify=self.ssl_verify)
+        request_args = {
+          'headers': headers,
+          'data': data,
+          'verify': self.ssl_verify
+        }
+        if self.ssl_client_cert and self.ssl_client_key:
+            request_args['cert'] = (self.ssl_client_cert, self.ssl_client_key)
+        return requests.api.request(method, url, **request_args)
 
     def request(self, method, path, headers={}, data=None):
         auth_headers = sign_request(key=self.key, http_method=method,
@@ -215,6 +250,8 @@ class ChefAPI(object):
             headers['content-type'] = 'application/json'
             data = json.dumps(data)
         response = self.request(method, path, headers, data)
+        if response.status_code == 404:
+          raise ChefServerNotFoundError("Object not found")
         return response.json()
 
     def __getitem__(self, path):
